@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	bsgetter "github.com/ipfs/go-bitswap/getter"
@@ -19,6 +20,8 @@ const (
 	broadcastLiveWantsLimit = 4
 	targetedLiveWantsLimit  = 32
 )
+
+var logger = logging.Logger("jimbssess")
 
 // WantManager is an interface that can be used to request blocks
 // from given peers.
@@ -156,6 +159,15 @@ func (s *Session) GetBlock(parent context.Context, k cid.Cid) (blocks.Block, err
 func (s *Session) GetBlocks(ctx context.Context, keys []cid.Cid) (<-chan blocks.Block, error) {
 	ctx = logging.ContextWithLoggable(ctx, s.uuid)
 
+	keysJson, err := json.Marshal(keys)
+	if err != nil {
+		panic("JSON Error")
+	}
+	logger.Event(context.TODO(), "getblocks", logging.Metadata{
+		"sessionId": s.id,
+		"sessionUuid": s.uuid,
+		"keys": string(keysJson),
+	})
 	return bsgetter.AsyncGetBlocks(ctx, s.ctx, keys, s.notif,
 		func(ctx context.Context, keys []cid.Cid) {
 			select {
