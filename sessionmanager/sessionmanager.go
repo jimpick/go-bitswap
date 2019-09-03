@@ -11,8 +11,11 @@ import (
 	notifications "github.com/ipfs/go-bitswap/notifications"
 	bssession "github.com/ipfs/go-bitswap/session"
 	exchange "github.com/ipfs/go-ipfs-exchange-interface"
+	logging "github.com/ipfs/go-log"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 )
+
+var log = logging.Logger("bitswap")
 
 // Session is a session that is managed by the session manager
 type Session interface {
@@ -99,6 +102,12 @@ func (sm *SessionManager) removeSession(session sesTrk) {
 	defer sm.sessLk.Unlock()
 	for i := 0; i < len(sm.sessions); i++ {
 		if sm.sessions[i] == session {
+			switch sess := session.session.(type) {
+			case *bssession.Session:
+				log.Event(context.TODO(), "jimbssessdone", logging.Metadata{
+					"sessionUuid": sess.UUID(),
+				})
+			}
 			sm.sessions[i] = sm.sessions[len(sm.sessions)-1]
 			sm.sessions[len(sm.sessions)-1] = sesTrk{} // free memory.
 			sm.sessions = sm.sessions[:len(sm.sessions)-1]

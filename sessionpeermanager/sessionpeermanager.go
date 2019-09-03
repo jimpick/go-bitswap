@@ -10,8 +10,11 @@ import (
 	bssd "github.com/ipfs/go-bitswap/sessiondata"
 
 	cid "github.com/ipfs/go-cid"
+	logging2 "github.com/ipfs/go-log"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 )
+
+var log = logging2.Logger("bitswap")
 
 const (
 	defaultTimeoutDuration = 5 * time.Second
@@ -226,6 +229,10 @@ type peerFoundMessage struct {
 
 func (pfm *peerFoundMessage) handle(spm *SessionPeerManager) {
 	p := pfm.p
+	log.Event(context.TODO(), "jimprovpeerfound", logging2.Metadata{
+		"peer": p,
+		"id:":  spm.id,
+	})
 	if _, ok := spm.activePeers[p]; !ok {
 		spm.activePeers[p] = newPeerData()
 		spm.insertPeer(p, spm.activePeers[p])

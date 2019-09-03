@@ -137,6 +137,18 @@ func (s *Session) ReceiveFrom(from peer.ID, ks []cid.Cid) {
 		return
 	}
 
+	keysJson, err := json.Marshal(ks)
+	if err != nil {
+		panic("JSON Error")
+	}
+	logger.Event(context.TODO(), "receivefrom", logging.Metadata{
+		"sessionId":   s.id,
+		"sessionUuid": s.uuid,
+		"peer":        from,
+		"numBlocks":   len(ks),
+		"keys":        string(keysJson),
+	})
+
 	select {
 	case s.incoming <- op{op: opReceive, from: from, keys: interested}:
 	case <-s.ctx.Done():
@@ -164,9 +176,10 @@ func (s *Session) GetBlocks(ctx context.Context, keys []cid.Cid) (<-chan blocks.
 		panic("JSON Error")
 	}
 	logger.Event(context.TODO(), "getblocks", logging.Metadata{
-		"sessionId": s.id,
+		"sessionId":   s.id,
 		"sessionUuid": s.uuid,
-		"keys": string(keysJson),
+		"numBlocks":   len(keys),
+		"keys":        string(keysJson),
 	})
 	return bsgetter.AsyncGetBlocks(ctx, s.ctx, keys, s.notif,
 		func(ctx context.Context, keys []cid.Cid) {
@@ -376,4 +389,9 @@ func (s *Session) wantLimit() int {
 		return targetedLiveWantsLimit
 	}
 	return broadcastLiveWantsLimit
+}
+
+// UUID return the uuid
+func (s *Session) UUID() logging.Loggable {
+	return s.uuid
 }

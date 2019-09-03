@@ -451,6 +451,9 @@ func (bs *Bitswap) blockstoreHas(blks []blocks.Block) []bool {
 // PeerConnected is called by the network interface
 // when a peer initiates a new connection to bitswap.
 func (bs *Bitswap) PeerConnected(p peer.ID) {
+	log.Event(context.TODO(), "jimbspeerconnect", logging.Metadata{
+		"peer": p,
+	})
 	bs.wm.Connected(p)
 	bs.engine.PeerConnected(p)
 }
@@ -458,6 +461,9 @@ func (bs *Bitswap) PeerConnected(p peer.ID) {
 // PeerDisconnected is called by the network interface when a peer
 // closes a connection
 func (bs *Bitswap) PeerDisconnected(p peer.ID) {
+	log.Event(context.TODO(), "jimbspeerdisconnect", logging.Metadata{
+		"peer": p,
+	})
 	bs.wm.Disconnected(p)
 	bs.engine.PeerDisconnected(p)
 }

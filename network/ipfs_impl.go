@@ -164,6 +164,12 @@ func (bsnet *impl) FindProvidersAsync(ctx context.Context, k cid.Cid, max int) <
 	out := make(chan peer.ID, max)
 	go func() {
 		defer close(out)
+		log.Event(context.TODO(), "jimprovstart", logging.Metadata{
+			"key": k,
+		})
+		defer log.Event(context.TODO(), "jimprovfinish", logging.Metadata{
+			"key": k,
+		})
 		providers := bsnet.routing.FindProvidersAsync(ctx, k, max)
 		for info := range providers {
 			if info.ID == bsnet.host.ID() {
@@ -172,6 +178,9 @@ func (bsnet *impl) FindProvidersAsync(ctx context.Context, k cid.Cid, max int) <
 			bsnet.host.Peerstore().AddAddrs(info.ID, info.Addrs, peerstore.TempAddrTTL)
 			select {
 			case <-ctx.Done():
+				log.Event(context.TODO(), "jimprovdone", logging.Metadata{
+					"key": k,
+				})
 				return
 			case out <- info.ID:
 			}
@@ -207,6 +216,9 @@ func (bsnet *impl) handleNewStream(s network.Stream) {
 		}
 
 		p := s.Conn().RemotePeer()
+		log.Event(context.TODO(), "jimbsstreamincoming", logging.Metadata{
+			"peer": p,
+		})
 		ctx := context.Background()
 		log.Debugf("bitswap net handleNewStream from %s", s.Conn().RemotePeer())
 		bsnet.receiver.ReceiveMessage(ctx, p, received)

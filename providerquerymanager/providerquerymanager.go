@@ -231,14 +231,26 @@ func (pqm *ProviderQueryManager) findProviderWorker() {
 			pqm.timeoutMutex.RLock()
 			findProviderCtx, cancel := context.WithTimeout(fpr.ctx, pqm.findProviderTimeout)
 			pqm.timeoutMutex.RUnlock()
+			log.Event(context.TODO(), "jimprovfind", logging.Metadata{
+				"key": k,
+			})
 			providers := pqm.network.FindProvidersAsync(findProviderCtx, k, maxProviders)
 			wg := &sync.WaitGroup{}
 			for p := range providers {
+				log.Event(context.TODO(), "jimprovfound", logging.Metadata{
+					"key":      k,
+					"provider": p,
+				})
 				wg.Add(1)
 				go func(p peer.ID) {
 					defer wg.Done()
 					err := pqm.network.ConnectTo(findProviderCtx, p)
 					if err != nil {
+						log.Event(context.TODO(), "jimprovconnerror", logging.Metadata{
+							"key":  k,
+							"peer": p,
+							"err":  err,
+						})
 						log.Debugf("failed to connect to provider %s: %s", p, err)
 						return
 					}

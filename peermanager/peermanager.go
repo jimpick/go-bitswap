@@ -6,8 +6,11 @@ import (
 	bsmsg "github.com/ipfs/go-bitswap/message"
 	wantlist "github.com/ipfs/go-bitswap/wantlist"
 
+	logging "github.com/ipfs/go-log"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 )
+
+var log = logging.Logger("bitswap")
 
 // PeerQueue provides a queue of messages to be sent for a single peer.
 type PeerQueue interface {
@@ -55,10 +58,17 @@ func (pm *PeerManager) ConnectedPeers() []peer.ID {
 // Connected is called to add a new peer to the pool, and send it an initial set
 // of wants.
 func (pm *PeerManager) Connected(p peer.ID, initialWants *wantlist.SessionTrackedWantlist) {
+	log.Event(context.TODO(), "jimbspeermanconnect", logging.Metadata{
+		"peer": p,
+	})
 	pq := pm.getOrCreate(p)
 
 	if pq.refcnt == 0 {
 		pq.pq.AddWantlist(initialWants)
+		log.Event(context.TODO(), "jimbspeermanconnectaddwants", logging.Metadata{
+			"peer":            p,
+			"initialWantsLen": initialWants.Len(),
+		})
 	}
 
 	pq.refcnt++
