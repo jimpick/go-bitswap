@@ -8,13 +8,14 @@ import (
 	"time"
 
 	bssd "github.com/ipfs/go-bitswap/sessiondata"
+	logging "github.com/ipfs/go-log"
 
 	cid "github.com/ipfs/go-cid"
-	logging2 "github.com/ipfs/go-log"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 )
 
-var log = logging2.Logger("bitswap")
+var log = logging.Logger("bs:sprmgr")
+var log2 = logging.Logger("bitswap")
 
 const (
 	defaultTimeoutDuration = 5 * time.Second
@@ -44,6 +45,7 @@ type SessionPeerManager struct {
 	ctx            context.Context
 	tagger         PeerTagger
 	providerFinder PeerProviderFinder
+	peers          *peer.Set
 	tag            string
 	id             uint64
 
@@ -64,7 +66,8 @@ func New(ctx context.Context, id uint64, tagger PeerTagger, providerFinder PeerP
 		id:               id,
 		tagger:           tagger,
 		providerFinder:   providerFinder,
-		peerMessages:     make(chan peerMessage, 16),
+		peers:            peer.NewSet(),
+		peerMessages:     make(chan peerMessage, 128),
 		activePeers:      make(map[peer.ID]*peerData),
 		broadcastLatency: newLatencyTracker(),
 		timeoutDuration:  defaultTimeoutDuration,
@@ -74,6 +77,19 @@ func New(ctx context.Context, id uint64, tagger PeerTagger, providerFinder PeerP
 
 	go spm.run(ctx)
 	return spm
+}
+
+func (spm *SessionPeerManager) ReceiveFrom(p peer.ID, ks []cid.Cid, haves []cid.Cid) bool {
+	if len(ks) > 0 || len(haves) > 0 && !spm.peers.Contains(p) {
+		log.Infof("Added peer %s to session: %d peers\n", p, spm.peers.Size())
+		spm.peers.Add(p)
+		return true
+	}
+	return false
+}
+
+func (spm *SessionPeerManager) Peers() *peer.Set {
+	return spm.peers
 }
 
 // RecordPeerResponse records that a peer received some blocks, and adds the
@@ -179,6 +195,11 @@ func (spm *SessionPeerManager) insertPeer(p peer.ID, data *peerData) {
 	} else {
 		spm.unoptimizedPeersArr = append(spm.unoptimizedPeersArr, p)
 	}
+
+	if !spm.peers.Contains(p) {
+		log.Infof("Added peer %s to session: %d peers\n", p, spm.peers.Size())
+		spm.peers.Add(p)
+	}
 }
 
 func (spm *SessionPeerManager) removeOptimizedPeer(p peer.ID) {
@@ -229,7 +250,7 @@ type peerFoundMessage struct {
 
 func (pfm *peerFoundMessage) handle(spm *SessionPeerManager) {
 	p := pfm.p
-	log.Event(context.TODO(), "jimprovpeerfound", logging2.Metadata{
+	log2.Event(context.TODO(), "jimprovpeerfound", logging.Metadata{
 		"peer": p,
 		"id:":  spm.id,
 	})

@@ -8,13 +8,18 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	// lu "github.com/ipfs/go-bitswap/logutil"
 	bsmsg "github.com/ipfs/go-bitswap/message"
+	pb "github.com/ipfs/go-bitswap/message/pb"
 	wl "github.com/ipfs/go-bitswap/wantlist"
+	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	bstore "github.com/ipfs/go-ipfs-blockstore"
 	logging "github.com/ipfs/go-log"
 	"github.com/ipfs/go-peertaskqueue"
 	"github.com/ipfs/go-peertaskqueue/peertask"
+	process "github.com/jbenet/goprocess"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 )
 
@@ -55,13 +60,49 @@ var log = logging.Logger("engine")
 const (
 	// outboxChanBuffer must be 0 to prevent stale messages from being sent
 	outboxChanBuffer = 0
-	// maxMessageSize is the maximum size of the batched payload
-	maxMessageSize = 512 * 1024
-	// tagPrefix is the tag given to peers associated an engine
-	tagPrefix = "bs-engine-%s"
+	// targetMessageSize is the ideal size of the batched payload. We try to
+	// pop this much data off the request queue, but it may be a little more
+	// or less depending on what's in the queue.
+	targetMessageSize = 16 * 1024
+	// tagFormat is the tag given to peers associated an engine
+	tagFormat = "bs-engine-%s-%s"
 
-	// tagWeight is the default weight for peers associated with an engine
-	tagWeight = 5
+	// queuedTagWeight is the default weight for peers that have work queued
+	// on their behalf.
+	queuedTagWeight = 10
+
+	// the alpha for the EWMA used to track short term usefulness
+	shortTermAlpha = 0.5
+
+	// the alpha for the EWMA used to track long term usefulness
+	longTermAlpha = 0.05
+
+	// long term ratio defines what "long term" means in terms of the
+	// shortTerm duration. Peers that interact once every longTermRatio are
+	// considered useful over the long term.
+	longTermRatio = 10
+
+	// long/short term scores for tagging peers
+	longTermScore  = 10 // this is a high tag but it grows _very_ slowly.
+	shortTermScore = 10 // this is a high tag but it'll go away quickly if we aren't using the peer.
+
+	// maxBlockSizeReplaceHasWithBlock is the maximum size of the block in
+	// bytes up to which we will replace a want-have with a want-block
+	maxBlockSizeReplaceHasWithBlock = 1024
+
+	// Number of concurrent workers that pull tasks off the request queue
+	taskWorkerCount = 8
+
+	// Number of concurrent workers that process requests to the blockstore
+	blockstoreWorkerCount = 128
+)
+
+var (
+	// how frequently the engine should sample usefulness. Peers that
+	// interact every shortTerm time period are considered "active".
+	//
+	// this is only a variable to make testing easier.
+	shortTerm = 10 * time.Second
 )
 
 // Envelope contains a message for a Peer.
@@ -101,40 +142,174 @@ type Engine struct {
 	// taskWorker goroutine
 	outbox chan (<-chan *Envelope)
 
-	bs bstore.Blockstore
+	bsm *blockstoreManager
 
 	peerTagger PeerTagger
 
-	tag  string
-	lock sync.Mutex // protects the fields immediatly below
+	tagQueued, tagUseful string
+
+	lock sync.RWMutex // protects the fields immediatly below
+
 	// ledgerMap lists Ledgers by their Partner key.
 	ledgerMap map[peer.ID]*ledger
 
 	ticker *time.Ticker
+
+	taskWorkerLock  sync.Mutex
+	taskWorkerCount int
+
+	// maxBlockSizeReplaceHasWithBlock is the maximum size of the block in
+	// bytes up to which we will replace a want-have with a want-block
+	maxBlockSizeReplaceHasWithBlock int
+
+	self peer.ID
 }
 
 // NewEngine creates a new block sending engine for the given block store
-func NewEngine(ctx context.Context, bs bstore.Blockstore, peerTagger PeerTagger) *Engine {
+func NewEngine(ctx context.Context, bs bstore.Blockstore, peerTagger PeerTagger, self peer.ID) *Engine {
+	return newEngine(ctx, bs, peerTagger, self, maxBlockSizeReplaceHasWithBlock)
+}
+
+// This constructor is used by the tests
+func newEngine(ctx context.Context, bs bstore.Blockstore, peerTagger PeerTagger, self peer.ID, maxReplaceSize int) *Engine {
 	e := &Engine{
-		ledgerMap:  make(map[peer.ID]*ledger),
-		bs:         bs,
-		peerTagger: peerTagger,
-		outbox:     make(chan (<-chan *Envelope), outboxChanBuffer),
-		workSignal: make(chan struct{}, 1),
-		ticker:     time.NewTicker(time.Millisecond * 100),
+		ledgerMap:                       make(map[peer.ID]*ledger),
+		bsm:                             newBlockstoreManager(ctx, bs, blockstoreWorkerCount),
+		peerTagger:                      peerTagger,
+		outbox:                          make(chan (<-chan *Envelope), outboxChanBuffer),
+		workSignal:                      make(chan struct{}, 1),
+		ticker:                          time.NewTicker(time.Millisecond * 100),
+		maxBlockSizeReplaceHasWithBlock: maxReplaceSize,
+		taskWorkerCount:                 taskWorkerCount,
+		self:                            self,
 	}
-	e.tag = fmt.Sprintf(tagPrefix, uuid.New().String())
-	e.peerRequestQueue = peertaskqueue.New(peertaskqueue.OnPeerAddedHook(e.onPeerAdded), peertaskqueue.OnPeerRemovedHook(e.onPeerRemoved))
-	go e.taskWorker(ctx)
+	e.tagQueued = fmt.Sprintf(tagFormat, "queued", uuid.New().String())
+	e.tagUseful = fmt.Sprintf(tagFormat, "useful", uuid.New().String())
+	e.peerRequestQueue = peertaskqueue.New(
+		peertaskqueue.OnPeerAddedHook(e.onPeerAdded),
+		peertaskqueue.OnPeerRemovedHook(e.onPeerRemoved),
+		peertaskqueue.TaskMerger(newTaskMerger()),
+		peertaskqueue.IgnoreFreezing(true))
+	go e.scoreWorker(ctx)
 	return e
 }
 
+// Start up workers to handle requests from other nodes for the data on this node
+func (e *Engine) StartWorkers(ctx context.Context, px process.Process) {
+	// Start up blockstore manager
+	e.bsm.start(px)
+
+	for i := 0; i < e.taskWorkerCount; i++ {
+		px.Go(func(px process.Process) {
+			e.taskWorker(ctx)
+		})
+	}
+}
+
+// scoreWorker keeps track of how "useful" our peers are, updating scores in the
+// connection manager.
+//
+// It does this by tracking two scores: short-term usefulness and long-term
+// usefulness. Short-term usefulness is sampled frequently and highly weights
+// new observations. Long-term usefulness is sampled less frequently and highly
+// weights on long-term trends.
+//
+// In practice, we do this by keeping two EWMAs. If we see an interaction
+// within the sampling period, we record the score, otherwise, we record a 0.
+// The short-term one has a high alpha and is sampled every shortTerm period.
+// The long-term one has a low alpha and is sampled every
+// longTermRatio*shortTerm period.
+//
+// To calculate the final score, we sum the short-term and long-term scores then
+// adjust it ±25% based on our debt ratio. Peers that have historically been
+// more useful to us than we are to them get the highest score.
+func (e *Engine) scoreWorker(ctx context.Context) {
+	ticker := time.NewTicker(shortTerm)
+	defer ticker.Stop()
+
+	type update struct {
+		peer  peer.ID
+		score int
+	}
+	var (
+		lastShortUpdate, lastLongUpdate time.Time
+		updates                         []update
+	)
+
+	for i := 0; ; i = (i + 1) % longTermRatio {
+		var now time.Time
+		select {
+		case now = <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+
+		// The long term update ticks every `longTermRatio` short
+		// intervals.
+		updateLong := i == 0
+
+		e.lock.Lock()
+		for _, ledger := range e.ledgerMap {
+			ledger.lk.Lock()
+
+			// Update the short-term score.
+			if ledger.lastExchange.After(lastShortUpdate) {
+				ledger.shortScore = ewma(ledger.shortScore, shortTermScore, shortTermAlpha)
+			} else {
+				ledger.shortScore = ewma(ledger.shortScore, 0, shortTermAlpha)
+			}
+
+			// Update the long-term score.
+			if updateLong {
+				if ledger.lastExchange.After(lastLongUpdate) {
+					ledger.longScore = ewma(ledger.longScore, longTermScore, longTermAlpha)
+				} else {
+					ledger.longScore = ewma(ledger.longScore, 0, longTermAlpha)
+				}
+			}
+
+			// Calculate the new score.
+			//
+			// The accounting score adjustment prefers peers _we_
+			// need over peers that need us. This doesn't help with
+			// leeching.
+			score := int((ledger.shortScore + ledger.longScore) * ((ledger.Accounting.Score())*.5 + .75))
+
+			// Avoid updating the connection manager unless there's a change. This can be expensive.
+			if ledger.score != score {
+				// put these in a list so we can perform the updates outside _global_ the lock.
+				updates = append(updates, update{ledger.Partner, score})
+				ledger.score = score
+			}
+			ledger.lk.Unlock()
+		}
+		e.lock.Unlock()
+
+		// record the times.
+		lastShortUpdate = now
+		if updateLong {
+			lastLongUpdate = now
+		}
+
+		// apply the updates
+		for _, update := range updates {
+			if update.score == 0 {
+				e.peerTagger.UntagPeer(update.peer, e.tagUseful)
+			} else {
+				e.peerTagger.TagPeer(update.peer, e.tagUseful, update.score)
+			}
+		}
+		// Keep the memory. It's not much and it saves us from having to allocate.
+		updates = updates[:0]
+	}
+}
+
 func (e *Engine) onPeerAdded(p peer.ID) {
-	e.peerTagger.TagPeer(p, e.tag, tagWeight)
+	e.peerTagger.TagPeer(p, e.tagQueued, queuedTagWeight)
 }
 
 func (e *Engine) onPeerRemoved(p peer.ID) {
-	e.peerTagger.UntagPeer(p, e.tag)
+	e.peerTagger.UntagPeer(p, e.tagQueued)
 }
 
 // WantlistForPeer returns the currently understood want list for a given peer
@@ -162,8 +337,11 @@ func (e *Engine) LedgerForPeer(p peer.ID) *Receipt {
 	}
 }
 
+// Each taskWorker pulls items off the request queue up to the maximum size
+// and adds them to an envelope that is passed off to the bitswap workers,
+// which send the message to the network.
 func (e *Engine) taskWorker(ctx context.Context) {
-	defer close(e.outbox) // because taskWorker uses the channel exclusively
+	defer e.taskWorkerExit()
 	for {
 		oneTimeUse := make(chan *Envelope, 1) // buffer to prevent blocking
 		select {
@@ -183,52 +361,100 @@ func (e *Engine) taskWorker(ctx context.Context) {
 	}
 }
 
+// taskWorkerExit handles cleanup of task workers
+func (e *Engine) taskWorkerExit() {
+	e.taskWorkerLock.Lock()
+	defer e.taskWorkerLock.Unlock()
+
+	e.taskWorkerCount--
+	if e.taskWorkerCount == 0 {
+		close(e.outbox)
+	}
+}
+
 // nextEnvelope runs in the taskWorker goroutine. Returns an error if the
 // context is cancelled before the next Envelope can be created.
 func (e *Engine) nextEnvelope(ctx context.Context) (*Envelope, error) {
 	for {
-		nextTask := e.peerRequestQueue.PopBlock()
-		for nextTask == nil {
+		// Pop some tasks off the request queue
+		p, nextTasks, pendingBytes := e.peerRequestQueue.PopTasks(targetMessageSize)
+		for len(nextTasks) == 0 {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-e.workSignal:
-				nextTask = e.peerRequestQueue.PopBlock()
+				p, nextTasks, pendingBytes = e.peerRequestQueue.PopTasks(targetMessageSize)
 			case <-e.ticker.C:
+				// When a task is cancelled, the queue may be "frozen" for a
+				// period of time. We periodically "thaw" the queue to make
+				// sure it doesn't get stuck in a frozen state.
 				e.peerRequestQueue.ThawRound()
-				nextTask = e.peerRequestQueue.PopBlock()
+				p, nextTasks, pendingBytes = e.peerRequestQueue.PopTasks(targetMessageSize)
 			}
 		}
 
-		// with a task in hand, we're ready to prepare the envelope...
+		// While there are more tasks to process
 		msg := bsmsg.New(true)
-		for _, entry := range nextTask.Tasks {
-			block, err := e.bs.Get(entry.Identifier.(cid.Cid))
-			if err != nil {
-				log.Errorf("tried to execute a task and errored fetching block: %s", err)
-				continue
-			}
-			msg.AddBlock(block)
+
+		// log.Debugf("  %s got %d tasks", lu.P(e.self), len(nextTasks))
+
+		// Amount of data in the request queue still waiting to be popped
+		msg.SetPendingBytes(int32(pendingBytes))
+
+		// Add DONT_HAVEs to the message
+		for _, c := range filterDontHaves(nextTasks) {
+			// log.Debugf("  make evlp %s->%s DONT_HAVE %s", lu.P(e.self), lu.P(p), lu.C(c))
+			msg.AddDontHave(c)
 		}
 
+		// Add HAVEs to the message
+		for _, c := range filterWantHaves(nextTasks) {
+			// log.Debugf("  make evlp %s->%s HAVE %s", lu.P(e.self), lu.P(p), lu.C(c))
+			msg.AddHave(c)
+		}
+
+		// Get requested blocks from the blockstore
+		blockTasks := filterWantBlocks(nextTasks)
+		blockCids := cid.NewSet()
+		for _, t := range blockTasks {
+			blockCids.Add(t.Topic.(cid.Cid))
+		}
+		blks := e.bsm.getBlocks(ctx, blockCids.Keys())
+
+		for _, t := range blockTasks {
+			c := t.Topic.(cid.Cid)
+			blk := blks[c]
+			// If the block was not found (it has been removed)
+			if blk == nil {
+				// If the client requested DONT_HAVE, add DONT_HAVE to the message
+				if t.Data.(*taskData).SendDontHave {
+					// log.Debugf("  make evlp %s->%s DONT_HAVE (expected block) %s", lu.P(e.self), lu.P(p), lu.C(c))
+					msg.AddDontHave(c)
+				}
+			} else {
+				// Add the block to the message
+				// log.Debugf("  make evlp %s->%s block: %s (%d bytes)", lu.P(e.self), lu.P(p), lu.C(c), len(blk.RawData()))
+				msg.AddBlock(blk)
+			}
+		}
+
+		// If there's nothing in the message, bail out
 		if msg.Empty() {
-			// If we don't have the block, don't hold that against the peer
-			// make sure to update that the task has been 'completed'
-			nextTask.Done(nextTask.Tasks)
+			e.peerRequestQueue.TasksDone(p, nextTasks...)
 			continue
 		}
 
+		// log.Debugf("  sending message %s->%s (%d blks / %d presences / %d bytes)\n", lu.P(e.self), lu.P(p), blkCount, presenceCount, msg.Size())
 		return &Envelope{
-			Peer:    nextTask.Target,
+			Peer:    p,
 			Message: msg,
 			Sent: func() {
-				nextTask.Done(nextTask.Tasks)
-				select {
-				case e.workSignal <- struct{}{}:
-					// work completing may mean that our queue will provide new
-					// work to be done.
-				default:
-				}
+				// Once the message has been sent, signal the request queue so
+				// it can be cleared from the queue
+				e.peerRequestQueue.TasksDone(p, nextTasks...)
+
+				// Signal the worker to check for more work
+				e.signalNewWork()
 			},
 		}, nil
 	}
@@ -241,8 +467,8 @@ func (e *Engine) Outbox() <-chan (<-chan *Envelope) {
 
 // Peers returns a slice of Peers with whom the local node has active sessions.
 func (e *Engine) Peers() []peer.ID {
-	e.lock.Lock()
-	defer e.lock.Unlock()
+	e.lock.RLock()
+	defer e.lock.RUnlock()
 
 	response := make([]peer.ID, 0, len(e.ledgerMap))
 
@@ -252,9 +478,25 @@ func (e *Engine) Peers() []peer.ID {
 	return response
 }
 
-// MessageReceived performs book-keeping. Returns error if passed invalid
-// arguments.
-func (e *Engine) MessageReceived(p peer.ID, m bsmsg.BitSwapMessage) {
+// MessageReceived is called when a message is received from a remote peer.
+// For each item in the wantlist, add a want-have or want-block entry to the
+// request queue (this is later popped off by the workerTasks)
+func (e *Engine) MessageReceived(ctx context.Context, p peer.ID, m bsmsg.BitSwapMessage) {
+	entries := m.Wantlist()
+
+	// if len(entries) > 0 {
+	// 	log.Debugf("engine-%s received message from %s with %d entries\n", lu.P(e.self), lu.P(p), len(entries))
+	// 	for _, et := range entries {
+	// 		if !et.Cancel {
+	// 			if et.WantType == pb.Message_Wantlist_Have {
+	// 				log.Debugf("  recv %s<-%s: want-have %s\n", lu.P(e.self), lu.P(p), lu.C(et.Cid))
+	// 			} else {
+	// 				log.Debugf("  recv %s<-%s: want-block %s\n", lu.P(e.self), lu.P(p), lu.C(et.Cid))
+	// 			}
+	// 		}
+	// 	}
+	// }
+
 	if m.Empty() {
 		log.Debugf("received empty message from %s", p)
 	}
@@ -266,81 +508,249 @@ func (e *Engine) MessageReceived(p peer.ID, m bsmsg.BitSwapMessage) {
 		}
 	}()
 
+	// Get block sizes
+	wants, cancels := e.splitWantsCancels(entries)
+	wantKs := cid.NewSet()
+	for _, entry := range wants {
+		wantKs.Add(entry.Cid)
+	}
+	blockSizes := e.bsm.getBlockSizes(ctx, wantKs.Keys())
+
+	// Get the ledger for the peer
 	l := e.findOrCreate(p)
-	l.lk.Lock()
-	defer l.lk.Unlock()
-	if m.Full() {
-		l.wantList = wl.New()
-	}
 
-	var msgSize int
-	var activeEntries []peertask.Task
-	for _, entry := range m.Wantlist() {
-		if entry.Cancel {
-			log.Debugf("%s cancel %s", p, entry.Cid)
-			l.CancelWant(entry.Cid)
-			e.peerRequestQueue.Remove(entry.Cid, p)
-		} else {
-			log.Debugf("wants %s - %d", entry.Cid, entry.Priority)
-			l.Wants(entry.Cid, entry.Priority)
-			blockSize, err := e.bs.GetSize(entry.Cid)
-			if err != nil {
-				if err == bstore.ErrNotFound {
-					continue
-				}
-				log.Error(err)
-			} else {
-				// we have the block
-				newWorkExists = true
-				if msgSize+blockSize > maxMessageSize {
-					e.peerRequestQueue.PushBlock(p, activeEntries...)
-					activeEntries = []peertask.Task{}
-					msgSize = 0
-				}
-				activeEntries = append(activeEntries, peertask.Task{Identifier: entry.Cid, Priority: entry.Priority})
-				msgSize += blockSize
-			}
-		}
-	}
-	if len(activeEntries) > 0 {
-		e.peerRequestQueue.PushBlock(p, activeEntries...)
-	}
-	for _, block := range m.Blocks() {
-		log.Debugf("got block %s %d bytes", block, len(block.RawData()))
-		l.ReceivedBytes(len(block.RawData()))
-	}
-}
-
-func (e *Engine) addBlocks(ks []cid.Cid) {
-	work := false
-
-	for _, l := range e.ledgerMap {
+	// Record how many bytes were received in the ledger
+	blks := m.Blocks()
+	if len(blks) > 0 {
 		l.lk.Lock()
-		for _, k := range ks {
-			if entry, ok := l.WantListContains(k); ok {
-				e.peerRequestQueue.PushBlock(l.Partner, peertask.Task{
-					Identifier: entry.Cid,
-					Priority:   entry.Priority,
-				})
-				work = true
+		for _, block := range blks {
+			log.Debugf("got block %s %d bytes", block, len(block.RawData()))
+			l.ReceivedBytes(len(block.RawData()))
+		}
+		l.lk.Unlock()
+	}
+
+	// If the peer sent a full wantlist, replace the ledger's wantlist
+	if m.Full() {
+		l.lk.Lock()
+		l.wantList = wl.New()
+		l.lk.Unlock()
+	}
+
+	var activeEntries []peertask.Task
+
+	// Remove cancelled blocks from the queue
+	if len(cancels) > 0 {
+		l.lk.Lock()
+		for _, entry := range cancels {
+			// log.Debugf("%s<-%s cancel %s", lu.P(e.self), lu.P(p), lu.C(entry.Cid))
+			if l.CancelWant(entry.Cid) {
+				e.peerRequestQueue.Remove(entry.Cid, p)
 			}
 		}
 		l.lk.Unlock()
 	}
+
+	// Add each want-have / want-block to the ledger (we do this separately
+	// from the for loop below so as to keep the lock for a shorter time)
+	if len(wants) > 0 {
+		l.lk.Lock()
+		for _, entry := range wants {
+			l.Wants(entry.Cid, entry.Priority, entry.WantType)
+		}
+		l.lk.Unlock()
+	}
+
+	// For each want-have / want-block
+	for _, entry := range wants {
+		c := entry.Cid
+		blockSize, found := blockSizes[entry.Cid]
+
+		// If the block was not found
+		if !found {
+			// Only add the task to the queue if the requester wants a DONT_HAVE
+			if entry.SendDontHave {
+				newWorkExists = true
+				isWantBlock := false
+				if entry.WantType == pb.Message_Wantlist_Block {
+					isWantBlock = true
+				}
+
+				// if isWantBlock {
+				// 	log.Debugf("  put rq %s->%s %s as want-block (not found)\n", lu.P(e.self), lu.P(p), lu.C(entry.Cid))
+				// } else {
+				// 	log.Debugf("  put rq %s->%s %s as want-have (not found)\n", lu.P(e.self), lu.P(p), lu.C(entry.Cid))
+				// }
+
+				activeEntries = append(activeEntries, peertask.Task{
+					Topic:    c,
+					Priority: entry.Priority,
+					Work:     e.getBlockPresenceSize(c),
+					Data: &taskData{
+						BlockSize:    0,
+						HaveBlock:    false,
+						IsWantBlock:  isWantBlock,
+						SendDontHave: entry.SendDontHave,
+					},
+				})
+			}
+			// log.Debugf("  not putting rq %s->%s %s (not found, SendDontHave false)\n", lu.P(e.self), lu.P(p), lu.C(entry.Cid))
+		} else {
+			// The block was found, add it to the queue
+			newWorkExists = true
+
+			isWantBlock := e.sendAsBlock(entry.WantType, blockSize)
+
+			// if isWantBlock {
+			// 	log.Debugf("  put rq %s->%s %s as want-block (%d bytes)\n", lu.P(e.self), lu.P(p), lu.C(entry.Cid), blockSize)
+			// } else {
+			// 	log.Debugf("  put rq %s->%s %s as want-have (%d bytes)\n", lu.P(e.self), lu.P(p), lu.C(entry.Cid), blockSize)
+			// }
+
+			// entrySize is the amount of space the entry takes up in the
+			// message we send to the recipient. If we're sending a block, the
+			// entrySize is the size of the block. Otherwise it's the size of
+			// a block presence entry.
+			entrySize := blockSize
+			if !isWantBlock {
+				entrySize = e.getBlockPresenceSize(c)
+			}
+			activeEntries = append(activeEntries, peertask.Task{
+				Topic:    c,
+				Priority: entry.Priority,
+				Work:     entrySize,
+				Data: &taskData{
+					BlockSize:    blockSize,
+					HaveBlock:    true,
+					IsWantBlock:  isWantBlock,
+					SendDontHave: entry.SendDontHave,
+				},
+			})
+		}
+	}
+
+	// Push entries onto the request queue
+	if len(activeEntries) > 0 {
+		e.peerRequestQueue.PushTasks(p, activeEntries...)
+	}
+}
+
+// Get the size of a HAVE / HAVE_NOT entry
+func (e *Engine) getBlockPresenceSize(c cid.Cid) int {
+	return bsmsg.BlockPresenceSize(c)
+}
+
+// Split the want-have / want-block entries from the cancel entries
+func (e *Engine) splitWantsCancels(es []bsmsg.Entry) ([]bsmsg.Entry, []bsmsg.Entry) {
+	var wants []bsmsg.Entry
+	var cancels []bsmsg.Entry
+	for _, et := range es {
+		if et.Cancel {
+			cancels = append(cancels, et)
+		} else {
+			wants = append(wants, et)
+		}
+	}
+	return wants, cancels
+}
+
+// ReceiveFrom is called when new blocks are received and added to the block
+// store, meaning there may be peers who want those blocks, so we should send
+// the blocks to them.
+func (e *Engine) ReceiveFrom(from peer.ID, blks []blocks.Block, haves []cid.Cid) {
+	// If we've received a block or a HAVE from a peer, we can remove any wants
+	// that peer sent us for the block
+	e.removeReceivedWants(from, blks, haves)
+
+	if len(blks) == 0 {
+		return
+	}
+
+	// Get the size of each block
+	blockSizes := make(map[cid.Cid]int)
+	for _, blk := range blks {
+		blockSizes[blk.Cid()] = len(blk.RawData())
+	}
+
+	// Check each peer to see if it wants one of the blocks we received
+	work := false
+	e.lock.RLock()
+	for _, l := range e.ledgerMap {
+		l.lk.RLock()
+
+		for _, b := range blks {
+			k := b.Cid()
+
+			if entry, ok := l.WantListContains(k); ok {
+				work = true
+
+				blockSize := blockSizes[k]
+				isWantBlock := e.sendAsBlock(entry.WantType, blockSize)
+
+				// if isWantBlock {
+				// 	log.Debugf("  add-block put rq %s->%s %s as want-block (%d bytes)\n", lu.P(e.self), lu.P(l.Partner), lu.C(k), blockSize)
+				// } else {
+				// 	log.Debugf("  add-block put rq %s->%s %s as want-have (%d bytes)\n", lu.P(e.self), lu.P(l.Partner), lu.C(k), blockSize)
+				// }
+
+				entrySize := blockSize
+				if !isWantBlock {
+					entrySize = e.getBlockPresenceSize(k)
+				}
+
+				e.peerRequestQueue.PushTasks(l.Partner, peertask.Task{
+					Topic:    entry.Cid,
+					Priority: entry.Priority,
+					Work:     entrySize,
+					Data: &taskData{
+						BlockSize:    blockSize,
+						HaveBlock:    true,
+						IsWantBlock:  isWantBlock,
+						SendDontHave: false,
+					},
+				})
+			}
+		}
+		l.lk.RUnlock()
+	}
+	e.lock.RUnlock()
 
 	if work {
 		e.signalNewWork()
 	}
 }
 
-// AddBlocks is called when new blocks are received and added to a block store,
-// meaning there may be peers who want those blocks, so we should send the blocks
-// to them.
-func (e *Engine) AddBlocks(ks []cid.Cid) {
-	e.lock.Lock()
-	defer e.lock.Unlock()
+// For each block or HAVE that the remote peer sends us we can remove the
+// correspoding want from their ledger
+func (e *Engine) removeReceivedWants(from peer.ID, blks []blocks.Block, haves []cid.Cid) {
+	if len(blks) == 0 && len(haves) == 0 {
+		return
+	}
 
-	e.addBlocks(ks)
+	e.lock.RLock()
+	l, ok := e.ledgerMap[from]
+	e.lock.RUnlock()
+
+	if !ok {
+		return
+	}
+
+	l.lk.Lock()
+	defer l.lk.Unlock()
+
+	for _, b := range blks {
+		c := b.Cid()
+		if l.CancelWant(c) {
+			// log.Debugf("%s: %s add-block rcvd block cancels %s", lu.P(e.self), lu.P(from), lu.C(c))
+			e.peerRequestQueue.Remove(c, from)
+		}
+	}
+	for _, c := range haves {
+		if l.CancelWant(c) {
+			// log.Debugf("%s: %s add-block rcvd HAVE cancels %s", lu.P(e.self), lu.P(from), lu.C(c))
+			e.peerRequestQueue.Remove(c, from)
+		}
+	}
 }
 
 // TODO add contents of m.WantList() to my local wantlist? NB: could introduce
@@ -356,12 +766,24 @@ func (e *Engine) MessageSent(p peer.ID, m bsmsg.BitSwapMessage) {
 	l.lk.Lock()
 	defer l.lk.Unlock()
 
+	// Remove sent blocks from the want list for the peer
 	for _, block := range m.Blocks() {
 		l.SentBytes(len(block.RawData()))
-		l.wantList.Remove(block.Cid())
-		e.peerRequestQueue.Remove(block.Cid(), p)
+		l.wantList.RemoveType(block.Cid(), pb.Message_Wantlist_Block)
 	}
 
+	// Remove sent block presences from the want list for the peer
+	for _, bp := range m.BlockPresences() {
+		// TODO: record block presence bytes as well?
+		// l.SentBytes(?)
+		if bp.Type == pb.Message_Have {
+			c, err := cid.Cast(bp.Cid)
+			if err != nil {
+				panic(err)
+			}
+			l.wantList.RemoveType(c, pb.Message_Wantlist_Have)
+		}
+	}
 }
 
 // PeerConnected is called when a new peer connects, meaning we should start
@@ -374,6 +796,7 @@ func (e *Engine) PeerConnected(p peer.ID) {
 		l = newLedger(p)
 		e.ledgerMap[p] = l
 	}
+
 	l.lk.Lock()
 	defer l.lk.Unlock()
 	l.ref++
@@ -387,12 +810,20 @@ func (e *Engine) PeerDisconnected(p peer.ID) {
 	if !ok {
 		return
 	}
+
 	l.lk.Lock()
 	defer l.lk.Unlock()
 	l.ref--
 	if l.ref <= 0 {
 		delete(e.ledgerMap, p)
 	}
+}
+
+// If the want is a want-have, and it's below a certain size, send the full
+// block (instead of sending a HAVE)
+func (e *Engine) sendAsBlock(wantType pb.Message_Wantlist_WantType, blockSize int) bool {
+	isWantBlock := wantType == pb.Message_Wantlist_Block
+	return isWantBlock || blockSize <= e.maxBlockSizeReplaceHasWithBlock
 }
 
 func (e *Engine) numBytesSentTo(p peer.ID) uint64 {
@@ -407,9 +838,20 @@ func (e *Engine) numBytesReceivedFrom(p peer.ID) uint64 {
 
 // ledger lazily instantiates a ledger
 func (e *Engine) findOrCreate(p peer.ID) *ledger {
+	// Take a read lock (as it's less expensive) to check if we have a ledger
+	// for the peer
+	e.lock.RLock()
+	l, ok := e.ledgerMap[p]
+	e.lock.RUnlock()
+	if ok {
+		return l
+	}
+
+	// There's no ledger, so take a write lock, then check again and create the
+	// ledger if necessary
 	e.lock.Lock()
 	defer e.lock.Unlock()
-	l, ok := e.ledgerMap[p]
+	l, ok = e.ledgerMap[p]
 	if !ok {
 		l = newLedger(p)
 		e.ledgerMap[p] = l
